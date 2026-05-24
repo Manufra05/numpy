@@ -11,7 +11,7 @@ namespace {
 using namespace np::simd;
 
 /*******************************************************************************
- ** 1. Motores Universais de Loops SIMD (Inlining Direto e Agressivo)
+ ** 1. SIMD Universal Loops Engines
  ******************************************************************************/
 #if NPY_HWY
 
@@ -35,7 +35,7 @@ static void simd_unary_loop_##NAME(T* op, const T* ip, npy_intp len) {   \
     }                                                                    \
 }
 
-// Injeção direta e ultra rápida das rotinas nativas do Google Highway
+// Native Google Highway routines
 NPY_GENERATE_SIMD_LOOP(absolute,  std::abs,   hn::Abs)
 NPY_GENERATE_SIMD_LOOP(square,    [](auto v) { return v*v; }, [](auto v) { return hn::Mul(v,v); })
 NPY_GENERATE_SIMD_LOOP(reciprocal,[](auto v) { return 1.0/v; }, [](auto v) { return hn::Div(hn::Set(hn::DFromV<decltype(v)>(), 1.0), v); })
@@ -48,23 +48,24 @@ NPY_GENERATE_SIMD_LOOP(rint,      std::rint,  hn::Round)
 #endif
 
 /*******************************************************************************
- ** 2. Gestor de Passos de Memória (Strides)
+ ** 2. Strides Manager
  ******************************************************************************/
 template <typename T, void (*SIMD_FUNC)(T*, const T*, npy_intp), T (*SCALAR_FUNC)(T)>
 static void execute_unary_ufunc(char** args, npy_intp const* dimensions, npy_intp const* steps) {
-    T *ip = reinterpret_cast<T*>(args[0]);
-    T *op = reinterpret_cast<T*>(args[1]);
+    char *ip_c = args[0];
+    char *op_c = args[1];
     npy_intp is = steps[0];
     npy_intp os = steps[1];
     npy_intp n = dimensions[0];
 
 #if NPY_HWY
-    if (is == sizeof(T) && os == sizeof(T)) {
-        SIMD_FUNC(op, ip, n);
+    if (is == sizeof(T) && os == sizeof(T) && !is_mem_overlap(ip_c, is, op_c, os, n)) {
+        SIMD_FUNC(reinterpret_cast<T*>(op_c), reinterpret_cast<T*>(ip_c), n);
         return;
     }
 #endif
-
+    T *ip = reinterpret_cast<T*>(ip_c);
+    T *op = reinterpret_cast<T*>(op_c);
     for (npy_intp i = 0; i < n; i++, ip = reinterpret_cast<T*>(reinterpret_cast<char*>(ip) + is), 
                                   op = reinterpret_cast<T*>(reinterpret_cast<char*>(op) + os)) {
         *op = SCALAR_FUNC(*ip);
@@ -83,7 +84,7 @@ template <typename T> static HWY_INLINE T scalar_rnt(T v)  { return std::rint(v)
 } // namespace anonymous
 
 /*******************************************************************************
- ** 3. Expansão Dinâmica do Despachante NumPy C-API (Tabela Centralizada)
+ ** 3. Dinammic expansion of Numpy C-API dispatch
  ******************************************************************************/
 #if NPY_HWY
   #define EXPAND_SIMD_FUNC(kind) simd_unary_loop_##kind
