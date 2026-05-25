@@ -9,17 +9,14 @@
 namespace {
 using namespace np::simd;
 
+/*******************************************************************************
+ ** Defining the SIMD kernels
+ ******************************************************************************/
 #if NPY_HWY
-/**
- * @brief Main vectorized execution engine for unrolled unary operations.
- *
- * Processes contiguous blocks of memory utilizing an explicit 4x unrolling factor.
- * This structure hides instruction latency, breaks dependency chains in the CPU's
- * out-of-order execution engine, and maximizes register occupancy.
- *
- * @tparam T Floating-point data type (float or double).
- * @tparam SCALAR_F Invokable scalar fallback function pointer/lambda.
- * @tparam HWY_F Highway SIMD functor encapsulating the native intrinsic target.
+/*
+ * Unrolled vector loop execution block.
+ * Employs a fixed unrolling factor of 4 to exploit instruction-level
+ * parallelism and saturate backend vector execution units.
  */
 template <typename T, typename SCALAR_F, typename HWY_F>
 HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop(T* op, const T* ip, npy_intp len, SCALAR_F scalar_func, HWY_F hwy_func) {
@@ -28,7 +25,7 @@ HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop(T* op, const 
     HWY_LANES_CONSTEXPR int vstep = Lanes<T>();
     const int wstep = vstep * UNROLL;
 
-    /* Primary Unrolled SIMD Loop - Processes 4 SIMD registers per iteration */
+    // Unrolled vectors loop
     for (; len >= wstep; len -= wstep, ip += wstep, op += wstep) {
         auto v0 = hn::LoadU(d, ip + vstep * 0);
         auto v1 = hn::LoadU(d, ip + vstep * 1);
@@ -39,21 +36,22 @@ HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop(T* op, const 
         hn::StoreU(hwy_func(d, v2), d, op + vstep * 2);
         hn::StoreU(hwy_func(d, v3), d, op + vstep * 3);
     }
-    /* Vector Tail Cleanup - Handles full remaining hardware vector lengths */
+
+    // Single vectors loop
     for (; len >= vstep; len -= vstep, ip += vstep, op += vstep) {
         hn::StoreU(hwy_func(d, hn::LoadU(d, ip)), d, op);
     }
-    /* Scalar Tail Cleanup - Processes final individual misaligned elements */
+
+    // Scalar loop to finish off
     for (; len > 0; len--, ip++, op++) {
         *op = scalar_func(*ip);
     }
 }
 
-/**
- * @brief Specialized execution engine for square/multiplication-based ufuncs.
- *
- * Bypasses redundant loads by utilizing the same register for both multiplication
- * operands, saving load execution unit pressure inside the core.
+/*
+ * Unrolled vector loop for power-of-two (square) computation.
+ * Feeds the loaded register twice into the Highway multiplier to optimize
+ * instruction port scheduling and avoid secondary pointer increments.
  */
 template <typename T, typename SCALAR_F, typename HWY_F>
 HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop_mul(T* op, const T* ip, npy_intp len, SCALAR_F scalar_func, HWY_F hwy_func) {
@@ -62,6 +60,7 @@ HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop_mul(T* op, co
     HWY_LANES_CONSTEXPR int vstep = Lanes<T>();
     const int wstep = vstep * UNROLL;
 
+    // Unrolled vectors loop
     for (; len >= wstep; len -= wstep, ip += wstep, op += wstep) {
         auto v0 = hn::LoadU(d, ip + vstep * 0);
         auto v1 = hn::LoadU(d, ip + vstep * 1);
@@ -72,20 +71,23 @@ HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop_mul(T* op, co
         hn::StoreU(hwy_func(d, v2, v2), d, op + vstep * 2);
         hn::StoreU(hwy_func(d, v3, v3), d, op + vstep * 3);
     }
+
+    // Single vectors loop
     for (; len >= vstep; len -= vstep, ip += vstep, op += vstep) {
         auto v = hn::LoadU(d, ip);
         hn::StoreU(hwy_func(d, v, v), d, op);
     }
+
+    // Scalar loop to finish off
     for (; len > 0; len--, ip++, op++) {
         *op = scalar_func(*ip);
     }
 }
 
-/**
- * @brief Specialized execution engine for reciprocal/division-based ufuncs.
- *
- * Broadcasts a literal 1.0 constant vector to memory registers outside the critical
- * path loop to eliminate instruction overhead inside the core.
+/*
+ * Unrolled vector loop for division-based operations (reciprocal).
+ * Materializes a vectorized scalar unit (1.0) invariant outside the core 
+ * pipeline loop to minimize instruction overhead inside execution units.
  */
 template <typename T, typename SCALAR_F, typename HWY_F>
 HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop_div(T* op, const T* ip, npy_intp len, SCALAR_F scalar_func, HWY_F hwy_func) {
@@ -94,6 +96,7 @@ HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop_div(T* op, co
     HWY_LANES_CONSTEXPR int vstep = Lanes<T>();
     const int wstep = vstep * UNROLL;
 
+    // Unrolled vectors loop
     for (; len >= wstep; len -= wstep, ip += wstep, op += wstep) {
         auto v0 = hn::LoadU(d, ip + vstep * 0);
         auto v1 = hn::LoadU(d, ip + vstep * 1);
@@ -105,16 +108,19 @@ HWY_ATTR SIMD_MSVC_NOINLINE static void execute_simd_unrolled_loop_div(T* op, co
         hn::StoreU(hwy_func(d, one, v2), d, op + vstep * 2);
         hn::StoreU(hwy_func(d, one, v3), d, op + vstep * 3);
     }
+
+    // Single vectors loop
     for (; len >= vstep; len -= vstep, ip += vstep, op += vstep) {
         auto v = hn::LoadU(d, ip);
         hn::StoreU(hwy_func(d, hn::Set(d, static_cast<T>(1.0)), v), d, op);
     }
+
+    // Scalar loop to finish off
     for (; len > 0; len--, ip++, op++) {
         *op = scalar_func(*ip);
     }
 }
 
-/* Macro instantiation wrappers binding specific ufuncs to Highway intrinsics */
 template <typename T> static void simd_unary_loop_absolute(T* op, const T* ip, npy_intp len) { execute_simd_unrolled_loop(op, ip, len, [](T v) { return std::abs(v); }, [](auto d, auto v) { return hn::Abs(v); }); }
 template <typename T> static void simd_unary_loop_square(T* op, const T* ip, npy_intp len) { execute_simd_unrolled_loop_mul(op, ip, len, [](T v) { return v * v; }, [](auto d, auto v1, auto v2) { return hn::Mul(v1, v2); }); }
 template <typename T> static void simd_unary_loop_reciprocal(T* op, const T* ip, npy_intp len) { execute_simd_unrolled_loop_div(op, ip, len, [](T v) { return static_cast<T>(1.0) / v; }, [](auto d, auto v1, auto v2) { return hn::Div(v1, v2); }); }
@@ -125,12 +131,10 @@ template <typename T> static void simd_unary_loop_trunc(T* op, const T* ip, npy_
 template <typename T> static void simd_unary_loop_rint(T* op, const T* ip, npy_intp len) { execute_simd_unrolled_loop(op, ip, len, [](T v) { return std::rint(v); }, [](auto d, auto v) { return hn::Round(v); }); }
 #endif
 
-/**
- * @brief High-level memory layout evaluator for single operand ufuncs.
- *
- * Examines array memory steps. Activates the underlying Highway SIMD fast-path
- * only if strides match type sizing constraints (perfectly contiguous memory buffers).
- * Otherwise, routes data safely through a standard scalar fallback.
+/*
+ * Outer framework evaluating strided layouts.
+ * Routes execution directly to the unrolled continuous Highway path if steps 
+ * match data sizes perfectly.
  */
 template <typename T, void (*SIMD_FUNC)(T*, const T*, npy_intp), T (*SCALAR_FUNC)(T)>
 static void execute_unary_ufunc(char** args, npy_intp const* dimensions, npy_intp const* steps) {
@@ -150,7 +154,6 @@ static void execute_unary_ufunc(char** args, npy_intp const* dimensions, npy_int
     }
 }
 
-/* Native fallback implementations leveraged on memory striding/slicing */
 template <typename T> static HWY_INLINE T scalar_abs(T v) { return std::abs(v); }
 template <typename T> static HWY_INLINE T scalar_sq(T v) { return v * v; }
 template <typename T> static HWY_INLINE T scalar_rec(T v) { return static_cast<T>(1.0) / v; }
@@ -161,6 +164,9 @@ template <typename T> static HWY_INLINE T scalar_trn(T v) { return std::trunc(v)
 template <typename T> static HWY_INLINE T scalar_rnt(T v) { return std::rint(v); }
 } // namespace anonymous
 
+/*******************************************************************************
+ ** Defining ufunc inner functions
+ ******************************************************************************/
 #if NPY_HWY
 #define EXPAND_SIMD_FUNC(kind) simd_unary_loop_##kind
 #else
@@ -168,11 +174,6 @@ template <typename T> static HWY_INLINE T scalar_rnt(T v) { return std::rint(v);
 #endif
 #define EXPAND_SIMD_FUNC_signbit nullptr
 
-/**
- * @brief Core NumPy dispatch macro generating architecture-specific entry points.
- *
- * Implements hardware-fused barriers to clean up CPU state flags on specific operations.
- */
 #define NPY_CREATE_UNARY_UFUNC(TYPE, ctype, kind, SCALAR, IS_ABS) \
 NPY_NO_EXPORT void NPY_CPU_DISPATCH_CURFX(TYPE##_##kind)(char **args, npy_intp const *dimensions, npy_intp const *steps, void *NPY_UNUSED(func)) \
 { \
@@ -182,7 +183,6 @@ NPY_NO_EXPORT void NPY_CPU_DISPATCH_CURFX(TYPE##_##kind)(char **args, npy_intp c
     } \
 }
 
-/* Expand Multi-Target CPU architecture map signatures for FLOAT32 and DOUBLE64 types */
 NPY_CREATE_UNARY_UFUNC(FLOAT, float, absolute, scalar_abs, 1)
 NPY_CREATE_UNARY_UFUNC(FLOAT, float, square, scalar_sq, 0)
 NPY_CREATE_UNARY_UFUNC(FLOAT, float, reciprocal, scalar_rec, 0)
